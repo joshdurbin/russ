@@ -1,0 +1,24 @@
+apiVersion: 1
+
+providers:
+  - name: russ
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    # editable=true lets the user tweak panels in the UI; the dashboard JSON
+    # on disk stays the source of truth.
+    editable: true
+    # Poll the dashboard file once at startup and never again. Our dashboard
+    # JSON is materialized once by russ and never changes at runtime, so
+    # background polling produced no benefit and was driving Grafana's
+    # dashboard-service into a "starting from scratch" reconciliation loop
+    # every cycle, contributing to OOM under the 12.x/13.x storage backend.
+    updateIntervalSeconds: 0
+    # allowUiUpdates=false means UI edits aren't persisted back over the file;
+    # Grafana doesn't have to reconcile UI/file divergence on every reload.
+    # The trade-off: UI edits to the dashboard don't survive a container restart.
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
