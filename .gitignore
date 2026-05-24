@@ -1,0 +1,18 @@
+# Binary
+russ
+
+# Build output
+dist/
+
+# Go
+*.test
+*.out
+vendor/
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp

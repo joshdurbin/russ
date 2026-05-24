@@ -1,0 +1,70 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Single shared redis-exporter operating in multi-target mode. Prometheus
+  # discovers Redis containers by label and rewrites each scrape to go through
+  # the exporter with ?target=<redis-uri>; the exporter dials that target
+  # on demand. No per-instance exporter sidecars needed.
+  - job_name: redis-instances
+    metrics_path: /scrape
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+        filters:
+          - name: label
+            values: ["russ.managed=true"]
+    relabel_configs:
+      # Only Redis master/replica containers — skip sentinels, prometheus,
+      # the shared exporter itself, and workload containers.
+      - source_labels: [__meta_docker_container_label_russ_role]
+        regex: '(master|replica)'
+        action: keep
+      # Containers can appear once per attached network. Keep only the russ-
+      # network entry so each Redis emits one target, not several.
+      - source_labels: [__meta_docker_network_name]
+        regex: russ
+        action: keep
+      # Build the Redis target URI from the container's own name + port labels.
+      # Container DNS resolves the name on the russ bridge.
+      - source_labels: [__meta_docker_container_label_russ_name, __meta_docker_container_label_russ_port]
+        regex: '(.+);(.+)'
+        replacement: 'redis://$1:$2'
+        target_label: __param_target
+      # Set a friendly instance label from the target URI (otherwise Prometheus
+      # would set instance=<russ-network-ip>:<port>, which churns on restarts).
+      - source_labels: [__param_target]
+        target_label: instance
+      # Promote container labels onto the time series.
+      - source_labels: [__meta_docker_container_label_russ_name]
+        target_label: redis_instance
+      - source_labels: [__meta_docker_container_label_russ_cluster]
+        target_label: redis_cluster
+      - source_labels: [__meta_docker_container_label_russ_version]
+        target_label: redis_version_major
+      # Finally route every scrape through the single shared exporter.
+      - target_label: __address__
+        replacement: russ-redis-exporter:9121
+
+  - job_name: workload
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+        filters:
+          - name: label
+            values: ["russ.role=client-workload"]
+    relabel_configs:
+      - source_labels: [__meta_docker_network_name]
+        regex: russ
+        action: keep
+      - source_labels: [__meta_docker_network_ip, __meta_docker_container_label_russ_target_port]
+        regex: '(.+);(.+)'
+        replacement: '$1:$2'
+        target_label: __address__
+      - source_labels: [__meta_docker_container_label_russ_cluster]
+        target_label: workload_cluster
