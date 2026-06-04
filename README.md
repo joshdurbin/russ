@@ -47,6 +47,10 @@ The cluster ends up at lifecycle state `MixedVersions` with the v8 instances dep
 
 ---
 
+## Quickstart Video
+
+[![Asciinema Demo](https://asciinema.org/a/1cLLeDjeeA1IHAJV.svg)](https://asciinema.org/a/1cLLeDjeeA1IHAJV)
+
 ## Upgrade path overview
 
 ```mermaid
