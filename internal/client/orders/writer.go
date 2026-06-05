@@ -16,8 +16,7 @@ import (
 
 // WriterConfig governs the wave-scaled enqueuer pool.
 type WriterConfig struct {
-	SentinelAddrs []string
-	MasterName    string
+	ClusterAddrs []string // Redis Cluster node addresses (container-name:port inside Docker)
 
 	MinClients    int           // pool size at wave trough
 	MaxClients    int           // pool size at wave peak
@@ -84,9 +83,8 @@ func NewWriter(cfg WriterConfig, metrics *Metrics) *Writer {
 		cfg.TaskTimeout = 30 * time.Second
 	}
 
-	client := asynq.NewClient(asynq.RedisFailoverClientOpt{
-		MasterName:    cfg.MasterName,
-		SentinelAddrs: cfg.SentinelAddrs,
+	client := asynq.NewClient(asynq.RedisClusterClientOpt{
+		Addrs: cfg.ClusterAddrs,
 	})
 
 	w := &Writer{

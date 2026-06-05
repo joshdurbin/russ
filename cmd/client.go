@@ -13,28 +13,19 @@ import (
 var clientCmd = &cobra.Command{
 	Use:   "client",
 	Short: "Manage russ-client (writer/processor/api) containers",
-	Long: `Build and run the three russ-client modes against a russ-managed Redis
-Sentinel cluster:
+	Long: `Build and run the russ-client workload against a russ-managed Redis Cluster:
 
-  writer     wave-scaled pool of short-lived enqueuers emitting person:insert
-             tasks onto the persons queue (asynq)
-  processor  asynq server consuming the persons + stats queues; the persons
-             handler writes durable Person/Address records to Redis and emits
-             a stats:update task; the stats handler atomically updates the
-             per-zip / per-state sorted sets
-  api        HTTP REST endpoints (GET /api/persons, /api/persons/{ssn},
-             /api/stats/by-zip, /api/stats/by-state) plus a Prometheus
-             /metrics endpoint
+  writer     wave-scaled pool of short-lived enqueuers emitting order:process tasks
+  processor  asynq server consuming orders_analytics; atomically updates analytics aggregates
+  api        HTTP REST endpoints for analytics + Prometheus /metrics
 
-All three containers join the russ Docker network, discover masters via
-SENTINEL, and emit Prometheus metrics on port 9300. The api container
-additionally publishes 9300 to host 127.0.0.1 so a browser/curl can reach
-the JSON endpoints.`,
+All three run in one container, join the russ Docker network, connect to the
+cluster nodes directly via Docker DNS, and emit Prometheus metrics on port 9300.`,
 }
 
 var clientLsCmd = &cobra.Command{
 	Use:   "ls",
-	Short: "List running russ-client containers (writer + processor + api)",
+	Short: "List running russ-client containers",
 	RunE:  runClientLs,
 }
 
@@ -69,8 +60,7 @@ var clientWorkloadStopCmd = &cobra.Command{
 }
 
 func init() {
-	// Writer flags (passed through to the russ-client `run` subcommand,
-	// which embeds writer goroutines coordinated via errgroup).
+	// Writer flags
 	clientWorkloadStartCmd.Flags().Int("min-clients", 2, "[writer] Enqueuer pool size at wave trough")
 	clientWorkloadStartCmd.Flags().Int("max-clients", 50, "[writer] Enqueuer pool size at wave peak")
 	clientWorkloadStartCmd.Flags().String("wave-period", "5m", "[writer] Full period of the load wave")
@@ -78,23 +68,22 @@ func init() {
 	clientWorkloadStartCmd.Flags().String("max-client-ttl", "30s", "[writer] Maximum enqueuer lifetime")
 	clientWorkloadStartCmd.Flags().String("tick", "100ms", "[writer] Per-enqueuer interval between enqueue attempts")
 	clientWorkloadStartCmd.Flags().Bool("burst", false, "[writer] Skip wave scaling; run at max-clients immediately")
-	clientWorkloadStartCmd.Flags().Int("customer-pool", 5000, "[writer] Pre-generated customer pool size (smaller = higher repeat-customer rate)")
-	clientWorkloadStartCmd.Flags().Int("catalog-size", 500, "[writer] Pre-generated product catalog size (smaller = stronger top-N concentration)")
+	clientWorkloadStartCmd.Flags().Int("customer-pool", 5000, "[writer] Pre-generated customer pool size")
+	clientWorkloadStartCmd.Flags().Int("catalog-size", 500, "[writer] Pre-generated product catalog size")
 	clientWorkloadStartCmd.Flags().Int("min-line-items", 1, "[writer] Minimum line items per order")
 	clientWorkloadStartCmd.Flags().Int("max-line-items", 5, "[writer] Maximum line items per order")
 
 	// Processor flags
-	clientWorkloadStartCmd.Flags().Int("concurrency", 100, "[processor] Worker goroutines across both queues")
+	clientWorkloadStartCmd.Flags().Int("concurrency", 100, "[processor] Worker goroutines")
 
-	// Subset toggles — useful for re-attaching to a running ingest, or
-	// running just the api against an already-populated cluster.
-	clientWorkloadStartCmd.Flags().Bool("no-writer", false, "Don't run the writer goroutine inside the container")
-	clientWorkloadStartCmd.Flags().Bool("no-processor", false, "Don't run the processor goroutine inside the container")
-	clientWorkloadStartCmd.Flags().Bool("no-api", false, "Don't run the api goroutine inside the container")
+	// Subset toggles
+	clientWorkloadStartCmd.Flags().Bool("no-writer", false, "Don't run the writer goroutine")
+	clientWorkloadStartCmd.Flags().Bool("no-processor", false, "Don't run the processor goroutine")
+	clientWorkloadStartCmd.Flags().Bool("no-api", false, "Don't run the api goroutine")
 
 	// Shared
-	clientWorkloadStartCmd.Flags().Int("metrics-port", 9300, "Container-internal port for /metrics + the JSON API")
-	clientWorkloadStartCmd.Flags().Int("api-host-port", 9300, "Host loopback port to publish the API on (0 = no publish, container reachable only on the russ network)")
+	clientWorkloadStartCmd.Flags().Int("metrics-port", 9300, "Container-internal port for /metrics + JSON API")
+	clientWorkloadStartCmd.Flags().Int("api-host-port", 9300, "Host loopback port to publish the API on (0 = no publish)")
 	clientWorkloadStartCmd.Flags().String("log-level", "info", "russ-client log level")
 
 	clientWorkloadCmd.AddCommand(clientWorkloadStartCmd, clientWorkloadStopCmd)
@@ -121,7 +110,7 @@ func runClientBuild(cmd *cobra.Command, _ []string) error {
 	return dm.BuildClientImage(ctx, force, projectRoot)
 }
 
-func runClientLs(cmd *cobra.Command, _ []string) error {
+func runClientLs(_ *cobra.Command, _ []string) error {
 	ctx := context.Background()
 	dm, err := docker.New()
 	if err != nil {
@@ -165,16 +154,12 @@ func runWorkloadStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("cluster %q has no Redis instances; create it with 'russ cluster create %s'", clusterName, clusterName)
 	}
 
-	sentinels, err := dm.ListSentinels(ctx)
-	if err != nil {
-		return err
-	}
-	if len(sentinels) == 0 {
-		return fmt.Errorf("no sentinels running; start them with 'russ sentinel add'")
-	}
-	sentinelAddrs := make([]string, 0, len(sentinels))
-	for _, s := range sentinels {
-		sentinelAddrs = append(sentinelAddrs, fmt.Sprintf("%s:%d", s.Name, s.Port))
+	// Build container-name:port addresses for Docker-internal access.
+	// The russ-client container runs on the same Docker network and can reach
+	// nodes via Docker DNS (container name resolution).
+	clusterNodeAddrs := make([]string, 0, len(instances))
+	for _, ci := range instances {
+		clusterNodeAddrs = append(clusterNodeAddrs, fmt.Sprintf("%s:%d", ci.Name, ci.Port))
 	}
 
 	metricsPort, _ := cmd.Flags().GetInt("metrics-port")
@@ -191,13 +176,13 @@ func runWorkloadStart(cmd *cobra.Command, args []string) error {
 		log.Info().Str("name", name).Msg("removed pre-existing client container")
 	}
 	id, err := dm.StartWorkload(ctx, docker.StartWorkloadOpts{
-		ContainerName: name,
-		ClusterName:   clusterName,
-		SentinelAddrs: sentinelAddrs,
-		MetricsPort:   metricsPort,
-		HostPort:      apiHostPort,
-		LogLevel:      logLevel,
-		ExtraArgs:     extra,
+		ContainerName:    name,
+		ClusterName:      clusterName,
+		ClusterNodeAddrs: clusterNodeAddrs,
+		MetricsPort:      metricsPort,
+		HostPort:         apiHostPort,
+		LogLevel:         logLevel,
+		ExtraArgs:        extra,
 	})
 	if err != nil {
 		return err
@@ -205,15 +190,11 @@ func runWorkloadStart(cmd *cobra.Command, args []string) error {
 	log.Info().
 		Str("name", name).
 		Str("id", id[:12]).
-		Str("api", fmt.Sprintf("http://127.0.0.1:%d/api/persons", apiHostPort)).
+		Str("api", fmt.Sprintf("http://127.0.0.1:%d/api/analytics/summary", apiHostPort)).
 		Msg("client container started (writer + processor + api in one process)")
 	return nil
 }
 
-// buildClientExtraArgs translates the host-side flags into the per-mode flags
-// the russ-client `run` subcommand expects. Only forwarded if the user set
-// them away from defaults (cobra's Changed() check); empty/zero values let
-// the russ-client side pick its own defaults.
 func buildClientExtraArgs(cmd *cobra.Command) []string {
 	var args []string
 	add := func(flag, val string) { args = append(args, "--"+flag, val) }
@@ -278,7 +259,7 @@ func buildClientExtraArgs(cmd *cobra.Command) []string {
 	return args
 }
 
-func runWorkloadStop(cmd *cobra.Command, args []string) error {
+func runWorkloadStop(_ *cobra.Command, args []string) error {
 	ctx := context.Background()
 	dm, err := docker.New()
 	if err != nil {

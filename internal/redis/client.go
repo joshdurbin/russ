@@ -46,27 +46,6 @@ func WaitForReady(ctx context.Context, port int) error {
 	}
 }
 
-// SetMaxMemory configures maxmemory and allkeys-lru eviction on a Redis instance.
-func SetMaxMemory(ctx context.Context, port int, size string) error {
-	rdb := newClient(port)
-	defer rdb.Close()
-	if err := rdb.ConfigSet(ctx, "maxmemory", size).Err(); err != nil {
-		return fmt.Errorf("CONFIG SET maxmemory on port %d: %w", port, err)
-	}
-	return rdb.ConfigSet(ctx, "maxmemory-policy", "allkeys-lru").Err()
-}
-
-// ConfigureReplica issues REPLICAOF masterContainerName masterPort on the replica.
-// masterContainerName is the Docker container name, resolvable within the russ network.
-func ConfigureReplica(ctx context.Context, replicaPort int, masterContainerName string, masterPort int) error {
-	rdb := newClient(replicaPort)
-	defer rdb.Close()
-	if err := rdb.Do(ctx, "REPLICAOF", masterContainerName, strconv.Itoa(masterPort)).Err(); err != nil {
-		return fmt.Errorf("REPLICAOF on replica port %d: %w", replicaPort, err)
-	}
-	return nil
-}
-
 // BreakReplication issues REPLICAOF NO ONE, making the instance a standalone master.
 func BreakReplication(ctx context.Context, port int) error {
 	rdb := newClient(port)
@@ -77,345 +56,46 @@ func BreakReplication(ctx context.Context, port int) error {
 	return nil
 }
 
-// Replica-priority values used by the upgrade lifecycle. Redis treats
-// lower numbers as higher promotion preference; 0 means "never promote".
-const (
-	// ReplicaPriorityDefault is Redis's own default — applied to v6 instances
-	// and to any v8 instance that's already past the V8Prioritized step.
-	ReplicaPriorityDefault = 100
-	// ReplicaPriorityV8Deprioritized is set on v8 instances during
-	// MixedVersions so a failover stays within the v6 subset and replication
-	// is not broken.
-	ReplicaPriorityV8Deprioritized = 200
-	// ReplicaPriorityV8Promoted is set on v8 instances after the operator
-	// runs `russ cluster promote-v8`. Sentinel then picks a v8 candidate
-	// on the next failover.
-	ReplicaPriorityV8Promoted = 1
-)
+// ReplicationState captures a Redis node's own view of its replication role.
+type ReplicationState struct {
+	Role             string
+	MasterHost       string
+	MasterPort       int
+	MasterLinkStatus string
+}
 
-// SetReplicaPriority sets the replica-priority config on a Redis instance.
-// Lower priority = preferred for promotion. 0 = never promote.
-func SetReplicaPriority(ctx context.Context, port int, priority int) error {
+// GetReplicationState reads INFO replication and returns the parsed state.
+func GetReplicationState(ctx context.Context, port int) (ReplicationState, error) {
 	rdb := newClient(port)
 	defer rdb.Close()
-	if err := rdb.ConfigSet(ctx, "replica-priority", strconv.Itoa(priority)).Err(); err != nil {
-		return fmt.Errorf("CONFIG SET replica-priority on port %d: %w", port, err)
-	}
-	return nil
-}
-
-// -- Sentinel management commands --
-
-func newSentinelClient(sentinelPort int) *goredis.Client {
-	return goredis.NewClient(&goredis.Options{
-		Addr:        addr(sentinelPort),
-		DialTimeout: 3 * time.Second,
-		Protocol:    2, // RESP2: sentinel commands return flat arrays, not RESP3 maps
-	})
-}
-
-// SentinelMonitor tells a sentinel to begin monitoring a master.
-// quorum is the number of sentinels that must agree for a failover.
-func SentinelMonitor(ctx context.Context, sentinelPort int, masterName, masterHost string, masterPort, quorum int) error {
-	rdb := newSentinelClient(sentinelPort)
-	defer rdb.Close()
-	err := rdb.Do(ctx, "SENTINEL", "MONITOR",
-		masterName, masterHost, strconv.Itoa(masterPort), strconv.Itoa(quorum),
-	).Err()
+	info, err := rdb.Info(ctx, "replication").Result()
 	if err != nil {
-		return fmt.Errorf("SENTINEL MONITOR on sentinel %d: %w", sentinelPort, err)
+		return ReplicationState{}, fmt.Errorf("INFO replication on port %d: %w", port, err)
 	}
-	// Configure reasonable defaults.
-	_ = rdb.Do(ctx, "SENTINEL", "SET", masterName, "down-after-milliseconds", "5000").Err()
-	_ = rdb.Do(ctx, "SENTINEL", "SET", masterName, "failover-timeout", "30000").Err()
-	_ = rdb.Do(ctx, "SENTINEL", "SET", masterName, "parallel-syncs", "1").Err()
-	return nil
-}
-
-// SentinelSetQuorum updates the quorum required for a failover on an already-monitored master.
-func SentinelSetQuorum(ctx context.Context, sentinelPort int, masterName string, quorum int) error {
-	rdb := newSentinelClient(sentinelPort)
-	defer rdb.Close()
-	if err := rdb.Do(ctx, "SENTINEL", "SET", masterName, "quorum", strconv.Itoa(quorum)).Err(); err != nil {
-		return fmt.Errorf("SENTINEL SET quorum on sentinel %d: %w", sentinelPort, err)
-	}
-	return nil
-}
-
-// SentinelRemove tells a sentinel to stop monitoring a master entirely.
-func SentinelRemove(ctx context.Context, sentinelPort int, masterName string) error {
-	rdb := newSentinelClient(sentinelPort)
-	defer rdb.Close()
-	if err := rdb.Do(ctx, "SENTINEL", "REMOVE", masterName).Err(); err != nil {
-		return fmt.Errorf("SENTINEL REMOVE on sentinel %d: %w", sentinelPort, err)
-	}
-	return nil
-}
-
-// SentinelReset tells a sentinel to reset its topology state for a master,
-// causing it to re-probe and forget any disappeared replicas.
-func SentinelReset(ctx context.Context, sentinelPort int, masterName string) error {
-	rdb := newSentinelClient(sentinelPort)
-	defer rdb.Close()
-	if err := rdb.Do(ctx, "SENTINEL", "RESET", masterName).Err(); err != nil {
-		return fmt.Errorf("SENTINEL RESET on sentinel %d: %w", sentinelPort, err)
-	}
-	return nil
-}
-
-// SentinelFailover triggers a manual failover for masterName on the given sentinel.
-func SentinelFailover(ctx context.Context, sentinelPort int, masterName string) error {
-	rdb := newSentinelClient(sentinelPort)
-	defer rdb.Close()
-	if err := rdb.Do(ctx, "SENTINEL", "FAILOVER", masterName).Err(); err != nil {
-		return fmt.Errorf("SENTINEL FAILOVER on sentinel %d: %w", sentinelPort, err)
-	}
-	return nil
-}
-
-// MasterInfo holds the current master's address as reported by a sentinel.
-type MasterInfo struct {
-	Host string
-	Port int
-}
-
-// SentinelGetMaster queries a sentinel for the current master of masterName.
-func SentinelGetMaster(ctx context.Context, sentinelPort int, masterName string) (MasterInfo, error) {
-	rdb := newSentinelClient(sentinelPort)
-	defer rdb.Close()
-
-	result, err := rdb.Do(ctx, "SENTINEL", "MASTER", masterName).Slice()
-	if err != nil {
-		return MasterInfo{}, fmt.Errorf("SENTINEL MASTER on sentinel %d: %w", sentinelPort, err)
-	}
-
-	kv := flatSliceToMap(result)
-	host := kv["ip"]
-	portStr := kv["port"]
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return MasterInfo{}, fmt.Errorf("invalid port in SENTINEL MASTER response: %q", portStr)
-	}
-	return MasterInfo{Host: host, Port: port}, nil
-}
-
-// SentinelListMasters returns all master names currently monitored by a sentinel.
-func SentinelListMasters(ctx context.Context, sentinelPort int) ([]string, error) {
-	rdb := newSentinelClient(sentinelPort)
-	defer rdb.Close()
-
-	result, err := rdb.Do(ctx, "SENTINEL", "MASTERS").Slice()
-	if err != nil {
-		return nil, fmt.Errorf("SENTINEL MASTERS on sentinel %d: %w", sentinelPort, err)
-	}
-
-	var names []string
-	for _, item := range result {
-		switch v := item.(type) {
-		case []interface{}:
-			kv := flatSliceToMap(v)
-			if name := kv["name"]; name != "" {
-				names = append(names, name)
-			}
+	var s ReplicationState
+	for _, line := range strings.Split(info, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "role:"):
+			s.Role = strings.TrimPrefix(line, "role:")
+		case strings.HasPrefix(line, "master_host:"):
+			s.MasterHost = strings.TrimPrefix(line, "master_host:")
+		case strings.HasPrefix(line, "master_port:"):
+			s.MasterPort, _ = strconv.Atoi(strings.TrimPrefix(line, "master_port:"))
+		case strings.HasPrefix(line, "master_link_status:"):
+			s.MasterLinkStatus = strings.TrimPrefix(line, "master_link_status:")
 		}
 	}
-	return names, nil
+	return s, nil
 }
 
-// SentinelListReplicas returns the replica addresses for masterName as reported by a sentinel.
-func SentinelListReplicas(ctx context.Context, sentinelPort int, masterName string) ([]MasterInfo, error) {
-	rdb := newSentinelClient(sentinelPort)
-	defer rdb.Close()
-
-	result, err := rdb.Do(ctx, "SENTINEL", "REPLICAS", masterName).Slice()
-	if err != nil {
-		return nil, fmt.Errorf("SENTINEL REPLICAS on sentinel %d: %w", sentinelPort, err)
-	}
-
-	var replicas []MasterInfo
-	for _, item := range result {
-		switch v := item.(type) {
-		case []interface{}:
-			kv := flatSliceToMap(v)
-			port, _ := strconv.Atoi(kv["port"])
-			replicas = append(replicas, MasterInfo{Host: kv["ip"], Port: port})
-		}
-	}
-	return replicas, nil
-}
-
-// ReplicaState captures sentinel's most recently observed view of a replica,
-// including the replica-priority it saw on the last INFO refresh.
-type ReplicaState struct {
-	Host     string
-	Port     int
-	Priority int
-}
-
-// SentinelReplicaStates returns sentinel's view of each replica including the
-// priority it last observed via INFO. Important: this is *sentinel's view*,
-// which lags the replica's actual config by up to one info-refresh interval
-// (~10s by default) after a CONFIG SET replica-priority.
-func SentinelReplicaStates(ctx context.Context, sentinelPort int, masterName string) ([]ReplicaState, error) {
-	rdb := newSentinelClient(sentinelPort)
-	defer rdb.Close()
-
-	result, err := rdb.Do(ctx, "SENTINEL", "REPLICAS", masterName).Slice()
-	if err != nil {
-		return nil, fmt.Errorf("SENTINEL REPLICAS on sentinel %d: %w", sentinelPort, err)
-	}
-
-	var states []ReplicaState
-	for _, item := range result {
-		v, ok := item.([]interface{})
-		if !ok {
-			continue
-		}
-		kv := flatSliceToMap(v)
-		port, _ := strconv.Atoi(kv["port"])
-		// Sentinel reports "slave-priority" regardless of Redis version (the
-		// field name is kept for backwards compatibility).
-		prio, _ := strconv.Atoi(kv["slave-priority"])
-		states = append(states, ReplicaState{
-			Host:     kv["ip"],
-			Port:     port,
-			Priority: prio,
-		})
-	}
-	return states, nil
-}
-
-// WaitForReplicaPriorities polls sentinel until every port in expected shows
-// the priority value the caller specifies in the map. Used after CONFIG SET
-// replica-priority on the replica itself to ensure sentinel has refreshed its
-// cached INFO and will honor the new priority during a SENTINEL FAILOVER.
-//
-// expected maps replica port → expected priority. Replicas not in the map are
-// ignored. Returns when every expected port matches, or when deadline elapses.
-func WaitForReplicaPriorities(ctx context.Context, sentinelPort int, masterName string, expected map[int]int, timeout time.Duration) error {
-	if len(expected) == 0 {
-		return nil
-	}
-	log.Debug().Int("sentinel_port", sentinelPort).Str("master", masterName).Int("replicas", len(expected)).Dur("timeout", timeout).Msg("waiting for sentinel to observe replica priorities")
-	deadline := time.Now().Add(timeout)
-	for {
-		states, err := SentinelReplicaStates(ctx, sentinelPort, masterName)
-		if err == nil {
-			seen := make(map[int]int, len(states))
-			for _, s := range states {
-				seen[s.Port] = s.Priority
-			}
-			satisfied := true
-			for port, want := range expected {
-				if got, ok := seen[port]; !ok || got != want {
-					satisfied = false
-					break
-				}
-			}
-			if satisfied {
-				return nil
-			}
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("sentinel did not observe expected replica priorities for master %q within %s", masterName, timeout)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(1 * time.Second):
-		}
-	}
-}
-
-// WaitForFailover polls a sentinel until the current master port for masterName
-// matches one of acceptablePorts, indicating the failover has completed.
-// Returns the port that was promoted.
-func WaitForFailover(ctx context.Context, sentinelPort int, masterName string, acceptablePorts ...int) (int, error) {
-	if len(acceptablePorts) == 0 {
-		return 0, fmt.Errorf("no acceptable target ports given")
-	}
-	log.Debug().Int("sentinel_port", sentinelPort).Str("master", masterName).Ints("acceptable_ports", acceptablePorts).Msg("waiting for failover to complete")
-	deadline := time.Now().Add(60 * time.Second)
-	for {
-		info, err := SentinelGetMaster(ctx, sentinelPort, masterName)
-		if err == nil {
-			for _, p := range acceptablePorts {
-				if info.Port == p {
-					return p, nil
-				}
-			}
-		}
-		if time.Now().After(deadline) {
-			return 0, fmt.Errorf("failover to one of %v did not complete within 60s", acceptablePorts)
-		}
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-time.After(500 * time.Millisecond):
-		}
-	}
-}
-
-// WaitForReplication polls until the replica at replicaPort reports it is
-// fully synced with the master at masterPort. "Fully synced" means three
-// conditions hold simultaneously:
-//
-//   - master_port matches the expected master (replicating from the right node)
-//   - master_link_status:up (TCP link established)
-//   - master_sync_in_progress:0 (no full-resync RDB transfer in flight)
-//
-// Returning before sync_in_progress drops to 0 would let the caller (e.g.
-// `russ instance add`) proceed to the *next* instance-add while the master
-// is still streaming a full RDB to the current replica. Sequential instance-
-// adds would then pile up on a still-busy master, compounding output-buffer
-// pressure on the master and increasing the odds of a cascading kick.
-func WaitForReplication(ctx context.Context, replicaPort int, masterPort int) error {
-	log.Debug().Int("replica_port", replicaPort).Int("master_port", masterPort).Msg("waiting for replication link up + full sync complete")
-	rdb := newClient(replicaPort)
-	defer rdb.Close()
-
-	deadline := time.Now().Add(60 * time.Second)
-	for {
-		info, err := rdb.Info(ctx, "replication").Result()
-		if err == nil {
-			if contains(info, fmt.Sprintf("master_port:%d", masterPort)) &&
-				contains(info, "master_link_status:up") &&
-				contains(info, "master_sync_in_progress:0") {
-				return nil
-			}
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("replica on port %d did not fully sync to master %d within 60s", replicaPort, masterPort)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(500 * time.Millisecond):
-		}
-	}
-}
-
-// ReplicationState captures a Redis node's own view of its replication role,
-// the master it's connected to, and the health of that link.
-type ReplicationState struct {
-	Role             string // "master" or "slave"
-	MasterHost       string // empty when Role == "master"
-	MasterPort       int    // 0 when Role == "master"
-	MasterLinkStatus string // "up" or "down"; empty when Role == "master"
-}
-
-// MemoryUsage captures the Redis-reported and OS-reported memory state. The
-// gap between UsedMemory (Redis's dataset accounting) and UsedMemoryRSS (the
-// kernel's view of the process's resident memory) is the load-bearing signal
-// for diagnosing things like fork CoW retention and replica output-buffer
-// accumulation: dataset stays bounded by maxmemory, but RSS can climb well
-// above that under sustained replication pressure.
+// MemoryUsage captures the Redis-reported and OS-reported memory state.
 type MemoryUsage struct {
-	UsedMemory         int64   // bytes — Redis's dataset accounting (bounded by maxmemory)
-	UsedMemoryRSS      int64   // bytes — OS-level resident set size (the cgroup-cap-relevant number)
-	UsedMemoryPeak     int64   // bytes — historical peak of UsedMemory since instance start
-	MemFragmentationRatio float64 // UsedMemoryRSS / UsedMemory; >1 means fragmentation or fork CoW retention
-	MaxMemory          int64   // bytes — configured cap, or 0 if unlimited
+	UsedMemory            int64
+	UsedMemoryRSS         int64
+	UsedMemoryPeak        int64
+	MemFragmentationRatio float64
+	MaxMemory             int64
 }
 
 // GetMemoryUsage reads INFO memory and parses out the load-bearing fields.
@@ -445,60 +125,135 @@ func GetMemoryUsage(ctx context.Context, port int) (MemoryUsage, error) {
 	return m, nil
 }
 
-// GetReplicationState reads INFO replication and returns the parsed state.
-func GetReplicationState(ctx context.Context, port int) (ReplicationState, error) {
+// --- Redis Cluster commands ---
+
+// ClusterNode represents a node as reported by CLUSTER NODES.
+type ClusterNode struct {
+	ID       string
+	Host     string
+	Port     int
+	IsMaster bool
+	MasterID string // non-empty for replicas
+}
+
+// ClusterMeet tells the node at port to connect to targetHost:targetPort.
+func ClusterMeet(ctx context.Context, port int, targetHost string, targetPort int) error {
 	rdb := newClient(port)
 	defer rdb.Close()
-	info, err := rdb.Info(ctx, "replication").Result()
-	if err != nil {
-		return ReplicationState{}, fmt.Errorf("INFO replication on port %d: %w", port, err)
+	if err := rdb.Do(ctx, "CLUSTER", "MEET", targetHost, strconv.Itoa(targetPort)).Err(); err != nil {
+		return fmt.Errorf("CLUSTER MEET on port %d → %s:%d: %w", port, targetHost, targetPort, err)
 	}
-	var s ReplicationState
-	for _, line := range strings.Split(info, "\n") {
+	return nil
+}
+
+// ClusterAddSlotsRange assigns a contiguous range of hash slots to the node at port.
+// Requires Redis 7+; Redis 8 supports this natively.
+func ClusterAddSlotsRange(ctx context.Context, port int, startSlot, endSlot int) error {
+	rdb := newClient(port)
+	defer rdb.Close()
+	if err := rdb.Do(ctx, "CLUSTER", "ADDSLOTSRANGE", startSlot, endSlot).Err(); err != nil {
+		return fmt.Errorf("CLUSTER ADDSLOTSRANGE %d-%d on port %d: %w", startSlot, endSlot, port, err)
+	}
+	return nil
+}
+
+// ClusterMyID returns the node's own cluster node ID.
+func ClusterMyID(ctx context.Context, port int) (string, error) {
+	rdb := newClient(port)
+	defer rdb.Close()
+	id, err := rdb.Do(ctx, "CLUSTER", "MYID").Text()
+	if err != nil {
+		return "", fmt.Errorf("CLUSTER MYID on port %d: %w", port, err)
+	}
+	return strings.TrimSpace(id), nil
+}
+
+// ClusterReplicate makes the node at port a replica of masterNodeID.
+func ClusterReplicate(ctx context.Context, port int, masterNodeID string) error {
+	rdb := newClient(port)
+	defer rdb.Close()
+	if err := rdb.Do(ctx, "CLUSTER", "REPLICATE", masterNodeID).Err(); err != nil {
+		return fmt.Errorf("CLUSTER REPLICATE on port %d: %w", port, err)
+	}
+	return nil
+}
+
+// ClusterForget removes nodeID from the cluster's view as seen from port.
+func ClusterForget(ctx context.Context, port int, nodeID string) error {
+	rdb := newClient(port)
+	defer rdb.Close()
+	if err := rdb.Do(ctx, "CLUSTER", "FORGET", nodeID).Err(); err != nil {
+		return fmt.Errorf("CLUSTER FORGET %s on port %d: %w", nodeID, port, err)
+	}
+	return nil
+}
+
+// ClusterReset performs a soft reset on the node at port, clearing its cluster membership.
+func ClusterReset(ctx context.Context, port int) error {
+	rdb := newClient(port)
+	defer rdb.Close()
+	return rdb.Do(ctx, "CLUSTER", "RESET", "SOFT").Err()
+}
+
+// ClusterInfo returns the raw CLUSTER INFO text from the node at port.
+func ClusterInfo(ctx context.Context, port int) (string, error) {
+	rdb := newClient(port)
+	defer rdb.Close()
+	return rdb.Do(ctx, "CLUSTER", "INFO").Text()
+}
+
+// ClusterNodes parses the CLUSTER NODES output from the node at port.
+func ClusterNodes(ctx context.Context, port int) ([]ClusterNode, error) {
+	rdb := newClient(port)
+	defer rdb.Close()
+	result, err := rdb.Do(ctx, "CLUSTER", "NODES").Text()
+	if err != nil {
+		return nil, fmt.Errorf("CLUSTER NODES on port %d: %w", port, err)
+	}
+	var nodes []ClusterNode
+	for _, line := range strings.Split(strings.TrimSpace(result), "\n") {
 		line = strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(line, "role:"):
-			s.Role = strings.TrimPrefix(line, "role:")
-		case strings.HasPrefix(line, "master_host:"):
-			s.MasterHost = strings.TrimPrefix(line, "master_host:")
-		case strings.HasPrefix(line, "master_port:"):
-			s.MasterPort, _ = strconv.Atoi(strings.TrimPrefix(line, "master_port:"))
-		case strings.HasPrefix(line, "master_link_status:"):
-			s.MasterLinkStatus = strings.TrimPrefix(line, "master_link_status:")
+		if line == "" {
+			continue
 		}
+		parts := strings.Fields(line)
+		if len(parts) < 8 {
+			continue
+		}
+		// addr field is "hostname:port@busport"
+		addrField := strings.Split(parts[1], "@")[0]
+		colonIdx := strings.LastIndex(addrField, ":")
+		nodeHost := addrField[:colonIdx]
+		nodePort, _ := strconv.Atoi(addrField[colonIdx+1:])
+
+		flags := parts[2]
+		masterField := parts[3]
+		isMaster := strings.Contains(flags, "master") && !strings.Contains(flags, "slave")
+		masterID := ""
+		if !isMaster && masterField != "-" {
+			masterID = masterField
+		}
+		nodes = append(nodes, ClusterNode{
+			ID:       parts[0],
+			Host:     nodeHost,
+			Port:     nodePort,
+			IsMaster: isMaster,
+			MasterID: masterID,
+		})
 	}
-	return s, nil
+	return nodes, nil
 }
 
-// ReplicationTarget returns the master_port a replica is connected to, plus its
-// master_host string. Returns ("", 0, nil) if the node reports itself as master.
-func ReplicationTarget(ctx context.Context, port int) (string, int, error) {
-	s, err := GetReplicationState(ctx, port)
-	if err != nil {
-		return "", 0, err
-	}
-	if s.Role == "master" {
-		return "", 0, nil
-	}
-	return s.MasterHost, s.MasterPort, nil
-}
-
-// WaitForSentinelToSeeReplica polls a sentinel until SENTINEL REPLICAS for the
-// named master includes replicaPort, or until the 30s deadline elapses.
-func WaitForSentinelToSeeReplica(ctx context.Context, sentinelPort int, masterName string, replicaPort int) error {
-	log.Debug().Int("sentinel_port", sentinelPort).Str("master", masterName).Int("replica_port", replicaPort).Msg("waiting for sentinel to see replica")
+// WaitForClusterNodes polls until the node at port sees at least expectedCount nodes in CLUSTER NODES.
+func WaitForClusterNodes(ctx context.Context, port int, expectedCount int) error {
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		replicas, err := SentinelListReplicas(ctx, sentinelPort, masterName)
-		if err == nil {
-			for _, r := range replicas {
-				if r.Port == replicaPort {
-					return nil
-				}
-			}
+		nodes, err := ClusterNodes(ctx, port)
+		if err == nil && len(nodes) >= expectedCount {
+			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("sentinel did not discover replica on port %d for master %q within 30s", replicaPort, masterName)
+			return fmt.Errorf("timeout: cluster at port %d has not reached %d nodes within 30s", port, expectedCount)
 		}
 		select {
 		case <-ctx.Done():
@@ -508,20 +263,46 @@ func WaitForSentinelToSeeReplica(ctx context.Context, sentinelPort int, masterNa
 	}
 }
 
-// -- helpers --
-
-func flatSliceToMap(slice []interface{}) map[string]string {
-	m := make(map[string]string, len(slice)/2)
-	for i := 0; i+1 < len(slice); i += 2 {
-		k, _ := slice[i].(string)
-		v, _ := slice[i+1].(string)
-		if k != "" {
-			m[k] = v
+// WaitForClusterNodeID polls CLUSTER NODES on port until nodeID appears in the local view.
+// Called before CLUSTER REPLICATE to ensure the replica has received the master's ID via gossip.
+func WaitForClusterNodeID(ctx context.Context, port int, nodeID string) error {
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		nodes, err := ClusterNodes(ctx, port)
+		if err == nil {
+			for _, n := range nodes {
+				if n.ID == nodeID {
+					return nil
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("node %s not visible in CLUSTER NODES on port %d after 15s", nodeID[:8], port)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
 		}
 	}
-	return m
 }
 
-func contains(s, sub string) bool {
-	return strings.Contains(s, sub)
+// WaitForClusterOK polls CLUSTER INFO until cluster_state:ok or the deadline elapses.
+func WaitForClusterOK(ctx context.Context, port int) error {
+	log.Debug().Int("port", port).Msg("waiting for cluster_state:ok")
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		info, err := ClusterInfo(ctx, port)
+		if err == nil && strings.Contains(info, "cluster_state:ok") {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("cluster at port %d did not reach state:ok within 60s", port)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 }

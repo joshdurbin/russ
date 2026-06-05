@@ -12,8 +12,7 @@ import (
 
 // ProcessorConfig governs the asynq Server that consumes orders_analytics.
 type ProcessorConfig struct {
-	SentinelAddrs []string
-	MasterName    string
+	ClusterAddrs []string // Redis Cluster node addresses (container-name:port inside Docker)
 
 	Concurrency int           // worker goroutine ceiling; 0 = 100
 	Timeout     time.Duration // per-task timeout; 0 = 30s
@@ -44,9 +43,8 @@ func NewProcessor(cfg ProcessorConfig, store *Store, metrics *Metrics) *Processo
 		cfg.MaxRetry = 3
 	}
 
-	rOpt := asynq.RedisFailoverClientOpt{
-		MasterName:    cfg.MasterName,
-		SentinelAddrs: cfg.SentinelAddrs,
+	rOpt := asynq.RedisClusterClientOpt{
+		Addrs: cfg.ClusterAddrs,
 	}
 	srv := asynq.NewServer(rOpt, asynq.Config{
 		Concurrency: cfg.Concurrency,

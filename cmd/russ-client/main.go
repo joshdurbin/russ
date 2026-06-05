@@ -1,17 +1,15 @@
 // russ-client is the workload simulator that runs inside Docker against a
-// russ-managed Redis Sentinel fleet. It implements an e-commerce orders
-// analytics engine over asynq: writers generate Order tasks, the processor
-// consumes them and atomically updates only the analytics aggregates in
-// Redis (no per-order durable storage), and a REST API surfaces those
-// aggregates.
+// russ-managed Redis Cluster. It implements an e-commerce orders analytics
+// engine over asynq: writers generate Order tasks, the processor consumes them
+// and atomically updates the analytics aggregates in Redis via Lua, and a
+// REST API surfaces those aggregates.
 //
 // Subcommands select the runtime mode:
 //
-//	russ-client list        — list sentinel-discovered masters and exit
-//	russ-client writer      — wave-scaled order:process enqueuer
-//	russ-client processor   — asynq server consuming orders_analytics
-//	russ-client api         — HTTP REST + Prometheus /metrics
-//	russ-client run         — all three in one process (default container mode)
+//	russ-client writer     — wave-scaled order:process enqueuer
+//	russ-client processor  — asynq server consuming orders_analytics
+//	russ-client api        — HTTP REST + Prometheus /metrics
+//	russ-client run        — all three in one process (default container mode)
 package main
 
 import (
@@ -25,7 +23,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bigcommerce/russ/internal/client"
 	"github.com/bigcommerce/russ/internal/client/orders"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -39,13 +36,7 @@ import (
 
 var rootCmd = &cobra.Command{
 	Use:   "russ-client",
-	Short: "E-commerce orders analytics workload simulator targeting a russ Sentinel-managed cluster",
-}
-
-var listCmd = &cobra.Command{
-	Use:   "list",
-	Short: "List masters discovered via sentinel and exit",
-	RunE:  runList,
+	Short: "E-commerce orders analytics workload simulator targeting a russ Redis Cluster",
 }
 
 var writerCmd = &cobra.Command{
@@ -78,14 +69,7 @@ var apiCmd = &cobra.Command{
 var runCmd = &cobra.Command{
 	Use:   "run",
 	Short: "Run writer + processor + api together in one process (default container mode)",
-	Long: `Starts all three modes coordinated by a single errgroup. The
-writer enqueues order:process tasks, the processor consumes them and atomically
-updates analytics aggregates in Redis, and the api serves /api/analytics/* +
-/metrics on --metrics-port.
-
-If any of the three errors out, the errgroup cancels the others. Use
---no-writer / --no-processor / --no-api to disable any subset.`,
-	RunE: runAll,
+	RunE:  runAll,
 }
 
 func init() {
@@ -95,10 +79,8 @@ func init() {
 		viper.AutomaticEnv()
 	})
 
-	rootCmd.PersistentFlags().StringSlice("sentinel", []string{"localhost:26379"},
-		"Sentinel addresses (comma-separated host:port)")
-	rootCmd.PersistentFlags().String("cluster", "",
-		"Sentinel master name to target (empty selects the only discovered master)")
+	rootCmd.PersistentFlags().StringSlice("nodes", []string{"localhost:6380"},
+		"Redis Cluster node addresses (comma-separated host:port; any reachable node suffices)")
 	rootCmd.PersistentFlags().String("log-level", "info",
 		"Log level: debug, info, warn, error")
 	rootCmd.PersistentFlags().Int("metrics-port", 9300,
@@ -137,7 +119,7 @@ func init() {
 	_ = viper.BindPFlags(processorCmd.Flags())
 	_ = viper.BindPFlags(runCmd.Flags())
 
-	rootCmd.AddCommand(listCmd, writerCmd, processorCmd, apiCmd, runCmd)
+	rootCmd.AddCommand(writerCmd, processorCmd, apiCmd, runCmd)
 }
 
 func main() {
@@ -154,50 +136,22 @@ func configureLogging() {
 	}
 }
 
-func sentinelAddrs() []string { return viper.GetStringSlice("sentinel") }
-func clusterName() string     { return viper.GetString("cluster") }
-func metricsPort() int        { return viper.GetInt("metrics-port") }
+func clusterNodeAddrs() []string { return viper.GetStringSlice("nodes") }
+func metricsPort() int           { return viper.GetInt("metrics-port") }
 
-func resolveMaster(ctx context.Context) (string, error) {
-	discoCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	masters, err := client.DiscoverMasters(discoCtx, sentinelAddrs())
-	if err != nil {
-		return "", err
-	}
-	chosen, err := client.PickMaster(masters, clusterName())
-	if err != nil {
-		return "", err
-	}
-	log.Info().
-		Str("cluster", chosen.Name).
-		Str("master", fmt.Sprintf("%s:%d", chosen.Host, chosen.Port)).
-		Msg("selected master")
-	return chosen.Name, nil
+// newClusterClient builds a go-redis ClusterClient. The russ-client always runs
+// inside Docker where container-name:port addresses are resolved by Docker DNS.
+// No Dialer override is needed — redirects (MOVED/ASK) carry container names
+// that Docker DNS resolves on the russ network just fine.
+func newClusterClient(addrs []string, poolSize int) *redis.ClusterClient {
+	return redis.NewClusterClient(&redis.ClusterOptions{
+		Addrs:       addrs,
+		PoolSize:    poolSize,
+		DialTimeout: 3 * time.Second,
+	})
 }
 
-func runList(_ *cobra.Command, _ []string) error {
-	configureLogging()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	masters, err := client.DiscoverMasters(ctx, sentinelAddrs())
-	if err != nil {
-		return err
-	}
-	if len(masters) == 0 {
-		fmt.Println("No masters discovered.")
-		return nil
-	}
-	fmt.Printf("%-20s  %s\n", "NAME", "ADDRESS")
-	for _, m := range masters {
-		fmt.Printf("%-20s  %s:%d\n", m.Name, m.Host, m.Port)
-	}
-	return nil
-}
-
-// serveMetricsOnly serves /metrics in a background goroutine. Used by the
-// standalone writer + processor subcommands; the api + run subcommands
-// serve /metrics inline with the JSON endpoints.
+// serveMetricsOnly serves /metrics in a background goroutine.
 func serveMetricsOnly(ctx context.Context, reg *prometheus.Registry) {
 	addr := fmt.Sprintf(":%d", metricsPort())
 	mux := http.NewServeMux()
@@ -222,17 +176,12 @@ func runWriter(_ *cobra.Command, _ []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	masterName, err := resolveMaster(ctx)
-	if err != nil {
-		return err
-	}
-
 	reg := prometheus.NewRegistry()
 	m := orders.NewMetrics()
 	m.Register(reg)
 	serveMetricsOnly(ctx, reg)
 
-	w := orders.NewWriter(writerConfigFromViper(masterName), m)
+	w := orders.NewWriter(writerConfigFromViper(), m)
 	defer w.Close()
 	w.Run(ctx)
 	return nil
@@ -243,26 +192,16 @@ func runProcessor(_ *cobra.Command, _ []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	masterName, err := resolveMaster(ctx)
-	if err != nil {
-		return err
-	}
-
 	reg := prometheus.NewRegistry()
 	m := orders.NewMetrics()
 	m.Register(reg)
 	serveMetricsOnly(ctx, reg)
 
-	rdb := redis.NewFailoverClient(&redis.FailoverOptions{
-		MasterName:    masterName,
-		SentinelAddrs: sentinelAddrs(),
-		PoolSize:      viper.GetInt("concurrency") + 16,
-		DialTimeout:   3 * time.Second,
-	})
+	rdb := newClusterClient(clusterNodeAddrs(), viper.GetInt("concurrency")+16)
 	defer rdb.Close()
 
 	store := orders.NewStore(rdb)
-	p := orders.NewProcessor(processorConfigFromViper(masterName), store, m)
+	p := orders.NewProcessor(processorConfigFromViper(), store, m)
 	return p.Run(ctx)
 }
 
@@ -271,21 +210,11 @@ func runAPI(_ *cobra.Command, _ []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	masterName, err := resolveMaster(ctx)
-	if err != nil {
-		return err
-	}
-
 	reg := prometheus.NewRegistry()
 	m := orders.NewMetrics()
 	m.Register(reg)
 
-	rdb := redis.NewFailoverClient(&redis.FailoverOptions{
-		MasterName:    masterName,
-		SentinelAddrs: sentinelAddrs(),
-		PoolSize:      32,
-		DialTimeout:   3 * time.Second,
-	})
+	rdb := newClusterClient(clusterNodeAddrs(), 32)
 	defer rdb.Close()
 
 	store := orders.NewStore(rdb)
@@ -293,36 +222,23 @@ func runAPI(_ *cobra.Command, _ []string) error {
 	return api.Serve(ctx, fmt.Sprintf(":%d", metricsPort()))
 }
 
-// runAll wires writer + processor + api into one process via errgroup.
-// All three goroutines share the same Prometheus registry and the same
-// Redis client pool (the writer opens its own via asynq.RedisFailoverClientOpt).
 func runAll(_ *cobra.Command, _ []string) error {
 	configureLogging()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	masterName, err := resolveMaster(ctx)
-	if err != nil {
-		return err
-	}
-
 	reg := prometheus.NewRegistry()
 	m := orders.NewMetrics()
 	m.Register(reg)
 
-	rdb := redis.NewFailoverClient(&redis.FailoverOptions{
-		MasterName:    masterName,
-		SentinelAddrs: sentinelAddrs(),
-		PoolSize:      viper.GetInt("concurrency") + 32,
-		DialTimeout:   3 * time.Second,
-	})
+	rdb := newClusterClient(clusterNodeAddrs(), viper.GetInt("concurrency")+32)
 	defer rdb.Close()
 	store := orders.NewStore(rdb)
 
 	g, gctx := errgroup.WithContext(ctx)
 
 	if !viper.GetBool("no-writer") {
-		w := orders.NewWriter(writerConfigFromViper(masterName), m)
+		w := orders.NewWriter(writerConfigFromViper(), m)
 		g.Go(func() error {
 			defer w.Close()
 			w.Run(gctx)
@@ -330,7 +246,7 @@ func runAll(_ *cobra.Command, _ []string) error {
 		})
 	}
 	if !viper.GetBool("no-processor") {
-		p := orders.NewProcessor(processorConfigFromViper(masterName), store, m)
+		p := orders.NewProcessor(processorConfigFromViper(), store, m)
 		g.Go(func() error { return p.Run(gctx) })
 	}
 	if !viper.GetBool("no-api") {
@@ -346,10 +262,9 @@ func runAll(_ *cobra.Command, _ []string) error {
 	return g.Wait()
 }
 
-func writerConfigFromViper(masterName string) orders.WriterConfig {
+func writerConfigFromViper() orders.WriterConfig {
 	return orders.WriterConfig{
-		SentinelAddrs: sentinelAddrs(),
-		MasterName:    masterName,
+		ClusterAddrs:  clusterNodeAddrs(),
 		MinClients:    viper.GetInt("min-clients"),
 		MaxClients:    viper.GetInt("max-clients"),
 		WavePeriod:    viper.GetDuration("wave-period"),
@@ -367,12 +282,11 @@ func writerConfigFromViper(masterName string) orders.WriterConfig {
 	}
 }
 
-func processorConfigFromViper(masterName string) orders.ProcessorConfig {
+func processorConfigFromViper() orders.ProcessorConfig {
 	return orders.ProcessorConfig{
-		SentinelAddrs: sentinelAddrs(),
-		MasterName:    masterName,
-		Concurrency:   viper.GetInt("concurrency"),
-		Timeout:       viper.GetDuration("timeout"),
-		MaxRetry:      viper.GetInt("max-retry"),
+		ClusterAddrs: clusterNodeAddrs(),
+		Concurrency:  viper.GetInt("concurrency"),
+		Timeout:      viper.GetDuration("timeout"),
+		MaxRetry:     viper.GetInt("max-retry"),
 	}
 }

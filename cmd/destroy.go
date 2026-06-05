@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/bigcommerce/russ/internal/docker"
-	"github.com/bigcommerce/russ/internal/state"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 )
@@ -16,9 +15,8 @@ import (
 var destroyCmd = &cobra.Command{
 	Use:   "destroy",
 	Short: "Destroy all russ-managed containers and the russ Docker network",
-	Long: `Stops and removes every container that russ has created (sentinels and
-Redis instances across all clusters), removes the "russ" Docker network, and
-deletes all persisted upgrade state from ~/.russ/state/.
+	Long: `Stops and removes every container that russ has created (Redis instances,
+client containers, and observability stack), removes the "russ" Docker network.
 
 Prompts for confirmation unless --yes is supplied.`,
 	RunE: runDestroy,
@@ -73,14 +71,6 @@ func runDestroy(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
-	// Collect cluster names before removing anything so we can clean up state files.
-	clusterNames := map[string]struct{}{}
-	for _, c := range containers {
-		if c.ClusterName != "" {
-			clusterNames[c.ClusterName] = struct{}{}
-		}
-	}
-
 	for _, c := range containers {
 		if err := dm.StopAndRemove(ctx, c.Name); err != nil {
 			log.Warn().Err(err).Str("name", c.Name).Msg("remove container")
@@ -108,15 +98,6 @@ func runDestroy(cmd *cobra.Command, _ []string) error {
 		log.Warn().Err(err).Str("network", docker.NetworkName).Msg("remove network")
 	} else {
 		log.Info().Str("network", docker.NetworkName).Msg("removed network")
-	}
-
-	// Clean up persisted upgrade state for every cluster we saw.
-	for name := range clusterNames {
-		if err := state.Delete(name); err != nil {
-			log.Warn().Err(err).Str("cluster", name).Msg("delete state")
-		} else {
-			log.Info().Str("cluster", name).Msg("deleted upgrade state")
-		}
 	}
 
 	log.Info().Msg("all russ resources destroyed")

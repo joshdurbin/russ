@@ -13,13 +13,11 @@ import (
 
 var rootCmd = &cobra.Command{
 	Use:   "russ",
-	Short: "Redis Upgrade Sentinel Simulator",
-	Long: `russ manages Redis and Redis Sentinel instances via Docker for testing
-upgrade paths from Redis 6.x to 8.x.
+	Short: "Redis Cluster Simulator",
+	Long: `russ manages Redis 8 Cluster instances via Docker.
 
 All containers are created on a shared Docker bridge network named "russ".
-State is tracked via Docker labels; upgrade lifecycle state is persisted to
-~/.russ/state/<cluster>.json.`,
+State is tracked via Docker labels.`,
 }
 
 func Execute() {
@@ -46,7 +44,6 @@ func init() {
 		}
 	})
 
-	rootCmd.AddCommand(sentinelCmd)
 	rootCmd.AddCommand(clusterCmd)
 	rootCmd.AddCommand(instanceCmd)
 	rootCmd.AddCommand(clientCmd)

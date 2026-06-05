@@ -97,8 +97,8 @@ func runObsStart(cmd *cobra.Command, _ []string) error {
 	log.Info().Str("name", docker.RedisExporterContainerName).Str("id", expID[:12]).Msg("shared redis-exporter started")
 
 	if _, running, _ := dm.GetPrometheus(ctx); running {
-		// Always rewrite the config file so any new scrape jobs (e.g. redis-sentinels)
-		// are present on disk, then hot-reload Prometheus without restarting the container.
+		// Always rewrite the config file so any new scrape targets are present on disk,
+		// then hot-reload Prometheus without restarting the container.
 		if err := docker.WritePrometheusConfig(); err != nil {
 			return fmt.Errorf("update prometheus config: %w", err)
 		}

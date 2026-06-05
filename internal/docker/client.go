@@ -31,17 +31,16 @@ func WorkloadContainerName(clusterName string) string {
 // StartWorkloadOpts configures the russ-client container that runs the
 // full writer + processor + api stack in a single process.
 type StartWorkloadOpts struct {
-	ContainerName string
-	ClusterName   string
-	SentinelAddrs []string
+	ContainerName    string
+	ClusterName      string
+	ClusterNodeAddrs []string // container-name:port addresses reachable within the russ Docker network
 
 	MetricsPort int    // /metrics + JSON API port inside the container; default 9300
 	HostPort    int    // host-side publish (127.0.0.1:HostPort); 0 = internal only
 	LogLevel    string
 	Memory      int64  // hard memory cap (bytes); 0 = DefaultClientContainerMemory
 
-	// Extra args appended verbatim to the `run` subcommand. The host CLI
-	// (cmd/client.go) builds these from its writer/processor/* flags.
+	// Extra args appended verbatim to the `run` subcommand.
 	ExtraArgs []string
 }
 
@@ -56,8 +55,8 @@ func (m *Manager) StartWorkload(ctx context.Context, opts StartWorkloadOpts) (st
 	if opts.ClusterName == "" {
 		return "", fmt.Errorf("cluster name is required")
 	}
-	if len(opts.SentinelAddrs) == 0 {
-		return "", fmt.Errorf("no sentinel addresses provided")
+	if len(opts.ClusterNodeAddrs) == 0 {
+		return "", fmt.Errorf("no cluster node addresses provided")
 	}
 	if opts.MetricsPort == 0 {
 		opts.MetricsPort = 9300
@@ -69,8 +68,7 @@ func (m *Manager) StartWorkload(ctx context.Context, opts StartWorkloadOpts) (st
 
 	args := []string{
 		"run",
-		"--sentinel", strings.Join(opts.SentinelAddrs, ","),
-		"--cluster", opts.ClusterName,
+		"--nodes", strings.Join(opts.ClusterNodeAddrs, ","),
 		"--metrics-port", strconv.Itoa(opts.MetricsPort),
 	}
 	if opts.LogLevel != "" {

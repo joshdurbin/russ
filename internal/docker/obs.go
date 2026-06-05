@@ -33,9 +33,6 @@ var grafanaRedisDashboardQuickstart string
 //go:embed grafana_russ_client_dashboard.json
 var grafanaRussClientDashboard string
 
-//go:embed grafana_russ_sentinel_dashboard.json
-var grafanaRussSentinelDashboard string
-
 const (
 	PrometheusImageTag         = "prom/prometheus:latest"
 	RedisExporterImageTag      = "oliver006/redis_exporter:latest"
@@ -397,14 +394,6 @@ var bundledDashboards = []bundledDashboard{
 		// substitution is required.
 		filename: "russ-client-workload.json",
 		content:  grafanaRussClientDashboard,
-	},
-	{
-		// Hand-built "Redis Sentinel" dashboard: sentinel counts by
-		// version, per-master status/slave counts/quorum visibility, and per-sentinel
-		// instance metrics (uptime, connected clients, memory). Uses the redis-sentinels
-		// Prometheus job which scrapes sentinel containers through the shared exporter.
-		filename: "russ-sentinel-fleet.json",
-		content:  grafanaRussSentinelDashboard,
 	},
 }
 

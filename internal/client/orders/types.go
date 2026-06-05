@@ -6,7 +6,7 @@
 // nil. Individual orders, customers, and line items are NEVER stored
 // durably in Redis. Only the *aggregate analytics* survive:
 //
-//	analytics:orders_count            — counter (INCR)
+//	{analytics}:orders_count          — counter (INCR)
 //	analytics:revenue_cents           — counter (INCRBY); cents to avoid float
 //	analytics:tax_cents               — counter
 //	analytics:shipping_cents          — counter
@@ -64,44 +64,45 @@ const (
 // Queue name.
 const QueueOrdersAnalytics = "orders_analytics"
 
-// Redis key namespace. All flat (no hash tags) since russ runs single-node
-// Sentinel-managed clusters, not Cluster Mode.
+// Redis key namespace. All keys use the {analytics} hash tag so they hash to
+// the same cluster slot — required for the Lua script (which touches all 35
+// keys in one EVAL) and for cross-key pipelines in the read paths.
 const (
-	KeyOrdersCount         = "analytics:orders_count"
-	KeyRevenueCents        = "analytics:revenue_cents"
-	KeyTaxCents            = "analytics:tax_cents"
-	KeyShippingCents       = "analytics:shipping_cents"
-	KeyLineItemsCount      = "analytics:line_items_count"
-	KeyByStateCount        = "analytics:by_state:count"
-	KeyByStateRevenue      = "analytics:by_state:revenue"
-	KeyTopProductsUnits    = "analytics:top_products:units"
-	KeyTopProductsRevenue  = "analytics:top_products:revenue"
-	KeyTopCategoriesUnits  = "analytics:top_categories:units"
-	KeyTopCategoriesRev    = "analytics:top_categories:revenue"
-	KeyProductMetadata     = "analytics:product_metadata"
-	KeyUniqueCustomersHLL  = "analytics:unique_customers"
-	KeyHourBucketPrefix    = "analytics:hour:" // + YYYY-MM-DD-HH; TTL'd
-	KeyOrderValueBuckets   = "analytics:order_value_buckets"
-	KeyTopOrdersByTotal     = "analytics:top_orders:by_total"
-	KeyTopOrdersByLineItems = "analytics:top_orders:by_line_items"
-	KeyTopOrdersByMaxItem   = "analytics:top_orders:by_max_item"
-	KeyCartSizeBuckets      = "analytics:cart_size_buckets"
-	KeyHourOfDayCount       = "analytics:hour_of_day:count"
-	KeyHourOfDayRevenue     = "analytics:hour_of_day:revenue"
-	KeyDayOfWeekCount       = "analytics:day_of_week:count"
-	KeyDayOfWeekRevenue     = "analytics:day_of_week:revenue"
-	KeyTopCustomersSpend    = "analytics:top_customers:spend"
-	KeyTopCustomersOrders   = "analytics:top_customers:orders"
-	KeyCustomerMetadata     = "analytics:customer_metadata"
-	KeyByZipCount           = "analytics:by_zip:count"
-	KeyByZipRevenue         = "analytics:by_zip:revenue"
-	KeyZipMetadata          = "analytics:zip_metadata"
-	KeyTopPairs             = "analytics:top_pairs"
-	KeySeenCustomers        = "analytics:seen_customers"
-	KeyOrdersNew            = "analytics:orders_new"
-	KeyOrdersReturning      = "analytics:orders_returning"
-	KeyRevenueNew           = "analytics:revenue_new"
-	KeyRevenueReturning     = "analytics:revenue_returning"
+	KeyOrdersCount         = "{analytics}:orders_count"
+	KeyRevenueCents        = "{analytics}:revenue_cents"
+	KeyTaxCents            = "{analytics}:tax_cents"
+	KeyShippingCents       = "{analytics}:shipping_cents"
+	KeyLineItemsCount      = "{analytics}:line_items_count"
+	KeyByStateCount        = "{analytics}:by_state:count"
+	KeyByStateRevenue      = "{analytics}:by_state:revenue"
+	KeyTopProductsUnits    = "{analytics}:top_products:units"
+	KeyTopProductsRevenue  = "{analytics}:top_products:revenue"
+	KeyTopCategoriesUnits  = "{analytics}:top_categories:units"
+	KeyTopCategoriesRev    = "{analytics}:top_categories:revenue"
+	KeyProductMetadata     = "{analytics}:product_metadata"
+	KeyUniqueCustomersHLL  = "{analytics}:unique_customers"
+	KeyHourBucketPrefix    = "{analytics}:hour:" // + YYYY-MM-DD-HH; TTL'd
+	KeyOrderValueBuckets   = "{analytics}:order_value_buckets"
+	KeyTopOrdersByTotal     = "{analytics}:top_orders:by_total"
+	KeyTopOrdersByLineItems = "{analytics}:top_orders:by_line_items"
+	KeyTopOrdersByMaxItem   = "{analytics}:top_orders:by_max_item"
+	KeyCartSizeBuckets      = "{analytics}:cart_size_buckets"
+	KeyHourOfDayCount       = "{analytics}:hour_of_day:count"
+	KeyHourOfDayRevenue     = "{analytics}:hour_of_day:revenue"
+	KeyDayOfWeekCount       = "{analytics}:day_of_week:count"
+	KeyDayOfWeekRevenue     = "{analytics}:day_of_week:revenue"
+	KeyTopCustomersSpend    = "{analytics}:top_customers:spend"
+	KeyTopCustomersOrders   = "{analytics}:top_customers:orders"
+	KeyCustomerMetadata     = "{analytics}:customer_metadata"
+	KeyByZipCount           = "{analytics}:by_zip:count"
+	KeyByZipRevenue         = "{analytics}:by_zip:revenue"
+	KeyZipMetadata          = "{analytics}:zip_metadata"
+	KeyTopPairs             = "{analytics}:top_pairs"
+	KeySeenCustomers        = "{analytics}:seen_customers"
+	KeyOrdersNew            = "{analytics}:orders_new"
+	KeyOrdersReturning      = "{analytics}:orders_returning"
+	KeyRevenueNew           = "{analytics}:revenue_new"
+	KeyRevenueReturning     = "{analytics}:revenue_returning"
 )
 
 // TopOrdersLimit is the per-list cap maintained by the processor's Lua
